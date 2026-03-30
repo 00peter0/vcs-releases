@@ -49,6 +49,20 @@ else
 fi
 
 # ============================================================================
+# 1b. MODE DETECTION (managed vs standalone)
+# ============================================================================
+
+SETUP_MODE="standalone"
+for arg in "$@"; do
+    if [[ "$arg" == "--managed" ]]; then
+        SETUP_MODE="managed"
+    fi
+done
+if [[ -n "${VCS_REGISTRATION_TOKEN:-}" ]]; then
+    SETUP_MODE="managed"
+fi
+
+# ============================================================================
 # 2. WELCOME BANNER
 # ============================================================================
 
@@ -102,29 +116,57 @@ ask() {
 
 echo ""
 echo -e "${BOLD}Configuration${NC}"
+echo -e "  Mode: ${CYAN}${SETUP_MODE}${NC}"
 echo ""
 
 ask VCS_INSTALL_PATH "Install path" "/opt/vcs-cloud-code"
 ask VCS_PORT         "Gateway port" "9000"
-ask VCS_DOMAIN       "Server domain (e.g. studio.example.com)" ""
-ask VCS_CF_TOKEN     "Cloudflare API Token (Account:Read + Tunnel:Edit + DNS:Edit)" ""
-ask VCS_CF_ZONE_ID   "Cloudflare Zone ID" ""
-ask VCS_CF_ZONE_NAME "Cloudflare Zone Name (e.g. example.com)" ""
-ask VCS_TUNNEL_NAME  "Tunnel name" "vcs-$(hostname)"
 
 INSTALL_PATH="$VCS_INSTALL_PATH"
 PORT="$VCS_PORT"
-DOMAIN="$VCS_DOMAIN"
-CF_TOKEN="$VCS_CF_TOKEN"
-CF_ZONE_ID="$VCS_CF_ZONE_ID"
-CF_ZONE_NAME="$VCS_CF_ZONE_NAME"
-TUNNEL_NAME="$VCS_TUNNEL_NAME"
 
-# Validate required fields
-[[ -z "$DOMAIN" ]]       && die "Server domain is required."
-[[ -z "$CF_TOKEN" ]]     && die "Cloudflare API Token is required."
-[[ -z "$CF_ZONE_ID" ]]   && die "Cloudflare Zone ID is required."
-[[ -z "$CF_ZONE_NAME" ]] && die "Cloudflare Zone Name is required."
+if [[ "$SETUP_MODE" == "managed" ]]; then
+    # --- Managed mode: tunnel created by central VCS API ---
+    ask VCS_API_URL            "VCS API URL" "https://app.virtucomputing.com"
+    ask VCS_REGISTRATION_TOKEN "Registration token" ""
+    ask VCS_SERVER_NAME        "Server name (e.g. client-studio-01)" ""
+
+    API_URL="$VCS_API_URL"
+    REGISTRATION_TOKEN="$VCS_REGISTRATION_TOKEN"
+    SERVER_NAME="$VCS_SERVER_NAME"
+
+    [[ -z "$REGISTRATION_TOKEN" ]] && die "Registration token is required."
+    [[ -z "$SERVER_NAME" ]]        && die "Server name is required."
+
+    # Auto-detect public IP
+    info "Detecting public IP..."
+    SERVER_IP=$(curl -fsSL https://api.ipify.org 2>/dev/null || curl -fsSL https://ifconfig.me 2>/dev/null || true)
+    if [[ -n "$SERVER_IP" ]]; then
+        ok "Public IP: ${SERVER_IP}"
+    else
+        warn "Could not detect public IP — will send empty"
+        SERVER_IP=""
+    fi
+else
+    # --- Standalone mode: client provides own CF credentials ---
+    ask VCS_DOMAIN       "Server domain (e.g. studio.example.com)" ""
+    ask VCS_CF_TOKEN     "Cloudflare API Token (Account:Read + Tunnel:Edit + DNS:Edit)" ""
+    ask VCS_CF_ZONE_ID   "Cloudflare Zone ID" ""
+    ask VCS_CF_ZONE_NAME "Cloudflare Zone Name (e.g. example.com)" ""
+    ask VCS_TUNNEL_NAME  "Tunnel name" "vcs-$(hostname)"
+
+    DOMAIN="$VCS_DOMAIN"
+    CF_TOKEN="$VCS_CF_TOKEN"
+    CF_ZONE_ID="$VCS_CF_ZONE_ID"
+    CF_ZONE_NAME="$VCS_CF_ZONE_NAME"
+    TUNNEL_NAME="$VCS_TUNNEL_NAME"
+
+    # Validate required fields
+    [[ -z "$DOMAIN" ]]       && die "Server domain is required."
+    [[ -z "$CF_TOKEN" ]]     && die "Cloudflare API Token is required."
+    [[ -z "$CF_ZONE_ID" ]]   && die "Cloudflare Zone ID is required."
+    [[ -z "$CF_ZONE_NAME" ]] && die "Cloudflare Zone Name is required."
+fi
 
 # ============================================================================
 # [1/8] Checking system requirements
@@ -250,44 +292,86 @@ fi
 
 step_header "5/8" "Installing Cloudflare tunnel..."
 
-CF_API="https://api.cloudflare.com/client/v4"
-CF_AUTH_HEADER="Authorization: Bearer ${CF_TOKEN}"
+if [[ "$SETUP_MODE" == "managed" ]]; then
+    # ── Managed mode: register with central VCS API ──
+    info "Registering with VCS API at ${API_URL}..."
+    REGISTER_RESP=$(curl -sf -X POST \
+        -H "Content-Type: application/json" \
+        -d "{\"registration_token\":\"${REGISTRATION_TOKEN}\",\"hostname\":\"$(hostname)\",\"server_name\":\"${SERVER_NAME}\",\"ip\":\"${SERVER_IP}\"}" \
+        "${API_URL}/api/servers/register") || \
+        die "Failed to contact VCS API at ${API_URL}/api/servers/register"
 
-# Get account ID
-info "Fetching Cloudflare account ID..."
-ACCOUNTS_RESP=$(curl -sf -H "$CF_AUTH_HEADER" "${CF_API}/accounts?per_page=1") || \
-    die "Failed to fetch Cloudflare accounts. Check your API token."
+    REGISTER_OK=$(echo "$REGISTER_RESP" | jq -r '.ok // false')
+    if [[ "$REGISTER_OK" != "true" ]]; then
+        REGISTER_ERROR=$(echo "$REGISTER_RESP" | jq -r '.error // "Unknown error"')
+        die "Registration failed: ${REGISTER_ERROR}"
+    fi
 
-ACCOUNT_ID=$(echo "$ACCOUNTS_RESP" | jq -r '.result[0].id // empty')
-[[ -z "$ACCOUNT_ID" ]] && die "No Cloudflare account found for this token."
-ok "Account ID: ${ACCOUNT_ID}"
+    TUNNEL_TOKEN=$(echo "$REGISTER_RESP" | jq -r '.tunnel_token')
+    TUNNEL_ID=$(echo "$REGISTER_RESP" | jq -r '.tunnel_id')
+    DOMAIN_URL=$(echo "$REGISTER_RESP" | jq -r '.subdomain_url')
+    DOMAIN="${DOMAIN_URL#https://}"
 
-# Create tunnel
-info "Creating tunnel '${TUNNEL_NAME}'..."
-TUNNEL_SECRET=$(openssl rand -base64 32)
+    [[ -z "$TUNNEL_TOKEN" || "$TUNNEL_TOKEN" == "null" ]] && die "No tunnel_token in registration response."
+    [[ -z "$TUNNEL_ID" || "$TUNNEL_ID" == "null" ]]       && die "No tunnel_id in registration response."
 
-TUNNEL_RESP=$(curl -sf -X POST \
-    -H "$CF_AUTH_HEADER" \
-    -H "Content-Type: application/json" \
-    -d "{\"name\":\"${TUNNEL_NAME}\",\"tunnel_secret\":\"${TUNNEL_SECRET}\"}" \
-    "${CF_API}/accounts/${ACCOUNT_ID}/cfd_tunnel") || \
-    die "Failed to create Cloudflare tunnel."
+    ok "Registered: ${DOMAIN}"
+    ok "Tunnel ID: ${TUNNEL_ID}"
 
-TUNNEL_SUCCESS=$(echo "$TUNNEL_RESP" | jq -r '.success')
-if [[ "$TUNNEL_SUCCESS" != "true" ]]; then
-    ERRORS=$(echo "$TUNNEL_RESP" | jq -r '.errors[]?.message // "Unknown error"')
-    die "Tunnel creation failed: ${ERRORS}"
-fi
-
-TUNNEL_ID=$(echo "$TUNNEL_RESP" | jq -r '.result.id')
-TUNNEL_TOKEN=$(echo "$TUNNEL_RESP" | jq -r '.result.token // empty')
-ok "Tunnel created: ${TUNNEL_ID}"
-
-# Save tunnel credentials
-CREDS_FILE="${INSTALL_PATH}/tunnel-credentials.json"
-if [[ -n "$TUNNEL_TOKEN" ]]; then
-    # New-style token-based tunnel
+    # Save tunnel info for reference
+    CREDS_FILE="${INSTALL_PATH}/tunnel-credentials.json"
     $SUDO tee "$CREDS_FILE" > /dev/null <<CREDS
+{
+  "TunnelID": "${TUNNEL_ID}",
+  "TunnelToken": "${TUNNEL_TOKEN}",
+  "Mode": "managed",
+  "ApiUrl": "${API_URL}",
+  "ServerName": "${SERVER_NAME}"
+}
+CREDS
+    $SUDO chmod 600 "$CREDS_FILE"
+    ok "Tunnel credentials saved to ${CREDS_FILE}"
+
+else
+    # ── Standalone mode: direct Cloudflare API ──
+    CF_API="https://api.cloudflare.com/client/v4"
+    CF_AUTH_HEADER="Authorization: Bearer ${CF_TOKEN}"
+
+    # Get account ID
+    info "Fetching Cloudflare account ID..."
+    ACCOUNTS_RESP=$(curl -sf -H "$CF_AUTH_HEADER" "${CF_API}/accounts?per_page=1") || \
+        die "Failed to fetch Cloudflare accounts. Check your API token."
+
+    ACCOUNT_ID=$(echo "$ACCOUNTS_RESP" | jq -r '.result[0].id // empty')
+    [[ -z "$ACCOUNT_ID" ]] && die "No Cloudflare account found for this token."
+    ok "Account ID: ${ACCOUNT_ID}"
+
+    # Create tunnel
+    info "Creating tunnel '${TUNNEL_NAME}'..."
+    TUNNEL_SECRET=$(openssl rand -base64 32)
+
+    TUNNEL_RESP=$(curl -sf -X POST \
+        -H "$CF_AUTH_HEADER" \
+        -H "Content-Type: application/json" \
+        -d "{\"name\":\"${TUNNEL_NAME}\",\"tunnel_secret\":\"${TUNNEL_SECRET}\"}" \
+        "${CF_API}/accounts/${ACCOUNT_ID}/cfd_tunnel") || \
+        die "Failed to create Cloudflare tunnel."
+
+    TUNNEL_SUCCESS=$(echo "$TUNNEL_RESP" | jq -r '.success')
+    if [[ "$TUNNEL_SUCCESS" != "true" ]]; then
+        ERRORS=$(echo "$TUNNEL_RESP" | jq -r '.errors[]?.message // "Unknown error"')
+        die "Tunnel creation failed: ${ERRORS}"
+    fi
+
+    TUNNEL_ID=$(echo "$TUNNEL_RESP" | jq -r '.result.id')
+    TUNNEL_TOKEN=$(echo "$TUNNEL_RESP" | jq -r '.result.token // empty')
+    ok "Tunnel created: ${TUNNEL_ID}"
+
+    # Save tunnel credentials
+    CREDS_FILE="${INSTALL_PATH}/tunnel-credentials.json"
+    if [[ -n "$TUNNEL_TOKEN" ]]; then
+        # New-style token-based tunnel
+        $SUDO tee "$CREDS_FILE" > /dev/null <<CREDS
 {
   "AccountTag": "${ACCOUNT_ID}",
   "TunnelID": "${TUNNEL_ID}",
@@ -296,8 +380,8 @@ if [[ -n "$TUNNEL_TOKEN" ]]; then
   "TunnelToken": "${TUNNEL_TOKEN}"
 }
 CREDS
-else
-    $SUDO tee "$CREDS_FILE" > /dev/null <<CREDS
+    else
+        $SUDO tee "$CREDS_FILE" > /dev/null <<CREDS
 {
   "AccountTag": "${ACCOUNT_ID}",
   "TunnelID": "${TUNNEL_ID}",
@@ -305,44 +389,45 @@ else
   "TunnelSecret": "${TUNNEL_SECRET}"
 }
 CREDS
-fi
-$SUDO chmod 600 "$CREDS_FILE"
-ok "Tunnel credentials saved to ${CREDS_FILE}"
+    fi
+    $SUDO chmod 600 "$CREDS_FILE"
+    ok "Tunnel credentials saved to ${CREDS_FILE}"
 
-# Configure tunnel ingress (route traffic to gateway)
-info "Configuring tunnel ingress..."
-INGRESS_RESP=$(curl -sf -X PUT \
-    -H "$CF_AUTH_HEADER" \
-    -H "Content-Type: application/json" \
-    -d "{\"config\":{\"ingress\":[{\"hostname\":\"${DOMAIN}\",\"service\":\"http://127.0.0.1:${PORT}\"},{\"service\":\"http_status:404\"}]}}" \
-    "${CF_API}/accounts/${ACCOUNT_ID}/cfd_tunnel/${TUNNEL_ID}/configurations") || \
-    warn "Failed to configure tunnel ingress — you may need to configure it manually."
+    # Configure tunnel ingress (route traffic to gateway)
+    info "Configuring tunnel ingress..."
+    INGRESS_RESP=$(curl -sf -X PUT \
+        -H "$CF_AUTH_HEADER" \
+        -H "Content-Type: application/json" \
+        -d "{\"config\":{\"ingress\":[{\"hostname\":\"${DOMAIN}\",\"service\":\"http://127.0.0.1:${PORT}\"},{\"service\":\"http_status:404\"}]}}" \
+        "${CF_API}/accounts/${ACCOUNT_ID}/cfd_tunnel/${TUNNEL_ID}/configurations") || \
+        warn "Failed to configure tunnel ingress — you may need to configure it manually."
 
-INGRESS_OK=$(echo "${INGRESS_RESP:-{}}" | jq -r '.success // false')
-if [[ "$INGRESS_OK" == "true" ]]; then
-    ok "Tunnel ingress configured"
-else
-    warn "Tunnel ingress configuration may have failed — verify in CF dashboard"
-fi
-
-# Create DNS CNAME record
-info "Creating DNS record: ${DOMAIN} → ${TUNNEL_ID}.cfargotunnel.com..."
-DNS_RESP=$(curl -sf -X POST \
-    -H "$CF_AUTH_HEADER" \
-    -H "Content-Type: application/json" \
-    -d "{\"type\":\"CNAME\",\"name\":\"${DOMAIN}\",\"content\":\"${TUNNEL_ID}.cfargotunnel.com\",\"proxied\":true}" \
-    "${CF_API}/zones/${CF_ZONE_ID}/dns_records") || \
-    warn "Failed to create DNS record — you may need to create it manually."
-
-DNS_OK=$(echo "${DNS_RESP:-{}}" | jq -r '.success // false')
-if [[ "$DNS_OK" == "true" ]]; then
-    ok "DNS CNAME record created"
-else
-    DNS_ERRORS=$(echo "${DNS_RESP:-{}}" | jq -r '.errors[]?.message // "Unknown"' 2>/dev/null)
-    if echo "$DNS_ERRORS" | grep -qi "already exists"; then
-        warn "DNS record already exists for ${DOMAIN}"
+    INGRESS_OK=$(echo "${INGRESS_RESP:-{}}" | jq -r '.success // false')
+    if [[ "$INGRESS_OK" == "true" ]]; then
+        ok "Tunnel ingress configured"
     else
-        warn "DNS record creation may have failed: ${DNS_ERRORS}"
+        warn "Tunnel ingress configuration may have failed — verify in CF dashboard"
+    fi
+
+    # Create DNS CNAME record
+    info "Creating DNS record: ${DOMAIN} → ${TUNNEL_ID}.cfargotunnel.com..."
+    DNS_RESP=$(curl -sf -X POST \
+        -H "$CF_AUTH_HEADER" \
+        -H "Content-Type: application/json" \
+        -d "{\"type\":\"CNAME\",\"name\":\"${DOMAIN}\",\"content\":\"${TUNNEL_ID}.cfargotunnel.com\",\"proxied\":true}" \
+        "${CF_API}/zones/${CF_ZONE_ID}/dns_records") || \
+        warn "Failed to create DNS record — you may need to create it manually."
+
+    DNS_OK=$(echo "${DNS_RESP:-{}}" | jq -r '.success // false')
+    if [[ "$DNS_OK" == "true" ]]; then
+        ok "DNS CNAME record created"
+    else
+        DNS_ERRORS=$(echo "${DNS_RESP:-{}}" | jq -r '.errors[]?.message // "Unknown"' 2>/dev/null)
+        if echo "$DNS_ERRORS" | grep -qi "already exists"; then
+            warn "DNS record already exists for ${DOMAIN}"
+        else
+            warn "DNS record creation may have failed: ${DNS_ERRORS}"
+        fi
     fi
 fi
 
