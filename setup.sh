@@ -58,7 +58,7 @@ for arg in "$@"; do
         SETUP_MODE="managed"
     fi
 done
-if [[ -n "${VCS_REGISTRATION_TOKEN:-}" ]]; then
+if [[ -n "${VCS_SETUP_TOKEN:-}" ]]; then
     SETUP_MODE="managed"
 fi
 
@@ -126,18 +126,13 @@ INSTALL_PATH="$VCS_INSTALL_PATH"
 PORT="$VCS_PORT"
 
 if [[ "$SETUP_MODE" == "managed" ]]; then
-    # --- Managed mode: tunnel created by central VCS API ---
-    ask VCS_API_URL            "VCS API URL" "https://app.virtucomputing.com"
-    ask VCS_REGISTRATION_TOKEN "Registration token" ""
-    ask VCS_SERVER_NAME        "Server name (e.g. client-studio-01)" ""
+    # --- Managed mode: token + API URL embedded by /api/setup/{token}/script ---
+    API_URL="${VCS_API_URL:?VCS_API_URL is required in managed mode}"
+    SETUP_TOKEN="${VCS_SETUP_TOKEN:?VCS_SETUP_TOKEN is required in managed mode}"
+    SERVER_NAME="${VCS_SERVER_NAME:-$(hostname)}"
 
-    API_URL="$VCS_API_URL"
-    REGISTRATION_TOKEN="$VCS_REGISTRATION_TOKEN"
-    SERVER_NAME="$VCS_SERVER_NAME"
+    # DOMAIN will be set after register call
     DOMAIN="${SERVER_NAME}.virtucomputing.com"
-
-    [[ -z "$REGISTRATION_TOKEN" ]] && die "Registration token is required."
-    [[ -z "$SERVER_NAME" ]]        && die "Server name is required."
 
     # Auto-detect public IP
     info "Detecting public IP..."
@@ -291,16 +286,22 @@ fi
 # [5/8] Installing Cloudflare tunnel
 # ============================================================================
 
-step_header "5/8" "Installing Cloudflare tunnel..."
+step_header "5/8" "Registering with VCS API / Installing Cloudflare tunnel..."
 
 if [[ "$SETUP_MODE" == "managed" ]]; then
     # ── Managed mode: register with central VCS API ──
+    # Read server UUID from server.json if it exists
+    SERVER_UUID=""
+    if [[ -f "${INSTALL_PATH}/server.json" ]]; then
+        SERVER_UUID=$(jq -r '.uuid // empty' "${INSTALL_PATH}/server.json" 2>/dev/null || true)
+    fi
+
     info "Registering with VCS API at ${API_URL}..."
     REGISTER_RESP=$(curl -sf -X POST \
         -H "Content-Type: application/json" \
-        -d "{\"registration_token\":\"${REGISTRATION_TOKEN}\",\"hostname\":\"$(hostname)\",\"server_name\":\"${SERVER_NAME}\",\"ip\":\"${SERVER_IP}\"}" \
-        "${API_URL}/api/servers/register") || \
-        die "Failed to contact VCS API at ${API_URL}/api/servers/register"
+        -d "{\"token\":\"${SETUP_TOKEN}\",\"hostname\":\"$(hostname)\",\"server_name\":\"${SERVER_NAME}\",\"ip\":\"${SERVER_IP}\",\"server_uuid\":\"${SERVER_UUID}\"}" \
+        "${API_URL}/api/setup/${SETUP_TOKEN}/register") || \
+        die "Failed to contact VCS API at ${API_URL}/api/setup/${SETUP_TOKEN}/register"
 
     REGISTER_OK=$(echo "$REGISTER_RESP" | jq -r '.ok // false')
     if [[ "$REGISTER_OK" != "true" ]]; then
@@ -318,6 +319,14 @@ if [[ "$SETUP_MODE" == "managed" ]]; then
 
     ok "Registered: ${DOMAIN}"
     ok "Tunnel ID: ${TUNNEL_ID}"
+
+    # Update gateway.conf with the real domain from API
+    $SUDO tee "${INSTALL_PATH}/gateway.conf" > /dev/null <<CONF
+DOMAIN=${DOMAIN}
+PORT=${PORT}
+INSTALL_PATH=${INSTALL_PATH}
+CONF
+    ok "gateway.conf updated with domain from API"
 
     # Save tunnel info for reference
     CREDS_FILE="${INSTALL_PATH}/tunnel-credentials.json"
