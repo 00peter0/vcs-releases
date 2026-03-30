@@ -134,6 +134,7 @@ if [[ "$SETUP_MODE" == "managed" ]]; then
     API_URL="$VCS_API_URL"
     REGISTRATION_TOKEN="$VCS_REGISTRATION_TOKEN"
     SERVER_NAME="$VCS_SERVER_NAME"
+    DOMAIN="${SERVER_NAME}.virtucomputing.com"
 
     [[ -z "$REGISTRATION_TOKEN" ]] && die "Registration token is required."
     [[ -z "$SERVER_NAME" ]]        && die "Server name is required."
